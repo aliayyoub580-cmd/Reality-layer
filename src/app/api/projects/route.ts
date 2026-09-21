@@ -13,29 +13,62 @@ export async function GET() {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const projects = await db.project.findMany({
-      where: { userId: session.user.id },
-      orderBy: { updatedAt: 'desc' },
-      include: {
-        crawls: {
-          orderBy: { createdAt: 'desc' },
-          take: 1,
-          select: {
-            id: true,
-            status: true,
-            pagesAnalyzed: true,
-            completedAt: true,
-            healthScore: true,
+    let projects: any[] = [];
+    let querySucceeded = false;
+
+    // 1. Try local db first
+    try {
+      projects = await db.project.findMany({
+        where: { userId: session.user.id },
+        orderBy: { updatedAt: 'desc' },
+        include: {
+          crawls: {
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+            select: {
+              id: true,
+              status: true,
+              pagesAnalyzed: true,
+              completedAt: true,
+              healthScore: true,
+            },
+          },
+          _count: {
+            select: {
+              pages: true,
+              issues: true,
+            },
           },
         },
-        _count: {
-          select: {
-            pages: true,
-            issues: true,
-          },
-        },
-      },
-    });
+      });
+      querySucceeded = true;
+    } catch (dbErr) {
+      console.warn('Local db project query notice:', dbErr);
+    }
+
+    // 2. If local query failed or returned empty, check Supabase
+    if (!querySucceeded || projects.length === 0) {
+      try {
+        const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+        if (isSupabaseConfigured()) {
+          const { data: sbProjects } = await supabaseAdmin.client
+            .from('Project')
+            .select('*')
+            .eq('userId', session.user.id)
+            .order('updatedAt', { ascending: false });
+
+          if (sbProjects && sbProjects.length > 0) {
+            projects = sbProjects.map((p) => ({
+              ...p,
+              crawls: [],
+              _count: { pages: 0, issues: 0 },
+            }));
+          }
+        }
+      } catch (sbErr) {
+        console.warn('Supabase projects query notice:', sbErr);
+      }
+    }
 
     return NextResponse.json({ success: true, data: projects });
   } catch (error) {
@@ -77,8 +110,84 @@ export async function POST(request: Request) {
     }
 
     const domain = extractDomain(url);
+    const projectId = `proj_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const finalUrl = urlValidation.normalizedUrl || url;
 
-    // Check for duplicate domain for this user
+    // 1. If Supabase is configured, use Supabase primary
+    try {
+      const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+      if (isSupabaseConfigured()) {
+        const { data: existingSb } = await supabaseAdmin.client
+          .from('Project')
+          .select('id')
+          .eq('userId', session.user.id)
+          .eq('domain', domain)
+          .maybeSingle();
+
+        if (existingSb) {
+          return NextResponse.json(
+            { error: `You already have a project for ${domain}` },
+            { status: 409 }
+          );
+        }
+
+        const { data: newProject, error: pError } = await supabaseAdmin.client
+          .from('Project')
+          .insert({
+            id: projectId,
+            userId: session.user.id,
+            name,
+            domain,
+            url: finalUrl,
+            crawlLimit: 100,
+            status: 'IDLE',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          })
+          .select()
+          .single();
+
+        if (pError) {
+          console.error('Supabase project creation error:', pError);
+          return NextResponse.json(
+            { error: pError.message || 'Failed to create project' },
+            { status: 500 }
+          );
+        }
+
+        // Try local mirror non-blocking
+        try {
+          await db.project.create({
+            data: {
+              id: projectId,
+              userId: session.user.id,
+              name,
+              domain,
+              url: finalUrl,
+            },
+          });
+          await db.auditLog.create({
+            data: {
+              userId: session.user.id,
+              projectId,
+              action: 'PROJECT_CREATED',
+              details: JSON.stringify({ name, url: finalUrl, domain }),
+            },
+          });
+        } catch {
+          // Ignored on serverless
+        }
+
+        return NextResponse.json(
+          { success: true, data: newProject || { id: projectId, name, domain, url: finalUrl } },
+          { status: 201 }
+        );
+      }
+    } catch (sbErr) {
+      console.warn('Supabase create project notice:', sbErr);
+    }
+
+    // 2. Fallback to local db
     const existingProject = await db.project.findFirst({
       where: {
         userId: session.user.id,
@@ -93,45 +202,25 @@ export async function POST(request: Request) {
       );
     }
 
-    // Create project
     const project = await db.project.create({
       data: {
         userId: session.user.id,
         name,
         domain,
-        url: urlValidation.normalizedUrl || url,
+        url: finalUrl,
       },
     });
 
-    // Sync to Supabase Project table
     try {
-      const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
-      if (isSupabaseConfigured()) {
-        await supabaseAdmin.client.from('Project').upsert({
-          id: project.id,
+      await db.auditLog.create({
+        data: {
           userId: session.user.id,
-          name: project.name,
-          domain: project.domain,
-          url: project.url,
-          crawlLimit: project.crawlLimit,
-          status: project.status,
-          healthScore: project.healthScore,
-          updatedAt: new Date().toISOString(),
-        });
-      }
-    } catch (sbErr) {
-      console.warn('Supabase project sync notice:', sbErr);
-    }
-
-    // Create audit log
-    await db.auditLog.create({
-      data: {
-        userId: session.user.id,
-        projectId: project.id,
-        action: 'PROJECT_CREATED',
-        details: JSON.stringify({ name, url, domain }),
-      },
-    });
+          projectId: project.id,
+          action: 'PROJECT_CREATED',
+          details: JSON.stringify({ name, url: finalUrl, domain }),
+        },
+      });
+    } catch {}
 
     return NextResponse.json(
       { success: true, data: project },

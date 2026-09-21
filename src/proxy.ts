@@ -15,16 +15,23 @@ export default auth((req) => {
     nextUrl.pathname.startsWith(route)
   );
 
+  // Helper to construct redirects ensuring the true request host is used (never localhost on production)
+  const getRedirectUrl = (path: string) => {
+    const host = req.headers.get('x-forwarded-host') || req.headers.get('host') || nextUrl.host;
+    const proto = req.headers.get('x-forwarded-proto') || (host.includes('localhost') ? 'http' : 'https');
+    return new URL(path, `${proto}://${host}`);
+  };
+
   // Redirect logged-in users away from auth pages
   if (isAuthRoute && isLoggedIn) {
-    return NextResponse.redirect(new URL('/dashboard', nextUrl));
+    return NextResponse.redirect(getRedirectUrl('/dashboard'));
   }
 
   // Redirect unauthenticated users to login
   if (isProtectedRoute && !isLoggedIn) {
     const callbackUrl = encodeURIComponent(nextUrl.pathname + nextUrl.search);
     return NextResponse.redirect(
-      new URL(`/login?callbackUrl=${callbackUrl}`, nextUrl)
+      getRedirectUrl(`/login?callbackUrl=${callbackUrl}`)
     );
   }
 

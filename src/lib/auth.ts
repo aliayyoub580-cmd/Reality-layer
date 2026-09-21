@@ -1,12 +1,11 @@
 import NextAuth from 'next-auth';
 import Credentials from 'next-auth/providers/credentials';
-import { PrismaAdapter } from '@auth/prisma-adapter';
 import bcrypt from 'bcryptjs';
 import { db } from '@/lib/db';
 import { loginSchema } from '@/lib/validations';
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
-  adapter: PrismaAdapter(db),
+  trustHost: true,
   session: {
     strategy: 'jwt',
   },
@@ -26,40 +25,42 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         if (!validated.success) return null;
 
         const { email, password } = validated.data;
+        const normalizedEmail = email.trim().toLowerCase();
 
-        let user = await db.user.findUnique({
-          where: { email },
-        });
+        let user: {
+          id: string;
+          name: string | null;
+          email: string;
+          password: string | null;
+          image?: string | null;
+        } | null = null;
 
-        // If not found in local DB, check Supabase
+        // 1. Check Supabase first (cloud primary)
+        try {
+          const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+          if (isSupabaseConfigured()) {
+            const { data: sbUser, error: sbError } = await supabaseAdmin.client
+              .from('User')
+              .select('*')
+              .ilike('email', normalizedEmail)
+              .maybeSingle();
+
+            if (!sbError && sbUser) {
+              user = sbUser;
+            }
+          }
+        } catch (sbErr) {
+          console.warn('Supabase auth query notice:', sbErr);
+        }
+
+        // 2. Fallback to local Prisma db if not found in Supabase
         if (!user) {
           try {
-            const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
-            if (isSupabaseConfigured()) {
-              const { data: sbUser } = await supabaseAdmin.client
-                .from('User')
-                .select('*')
-                .eq('email', email)
-                .maybeSingle();
-
-              if (sbUser) {
-                user = await db.user.upsert({
-                  where: { email },
-                  create: {
-                    id: sbUser.id,
-                    name: sbUser.name,
-                    email: sbUser.email,
-                    password: sbUser.password,
-                  },
-                  update: {
-                    name: sbUser.name,
-                    password: sbUser.password,
-                  },
-                });
-              }
-            }
-          } catch (sbErr) {
-            console.warn('Supabase auth query error:', sbErr);
+            user = await db.user.findUnique({
+              where: { email: normalizedEmail },
+            });
+          } catch (dbErr) {
+            console.warn('Local db query notice:', dbErr);
           }
         }
 
@@ -70,9 +71,9 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
 
         return {
           id: user.id,
-          name: user.name,
+          name: user.name ?? undefined,
           email: user.email,
-          image: user.image,
+          image: user.image ?? undefined,
         };
       },
     }),

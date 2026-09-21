@@ -14,23 +14,51 @@ export default async function DashboardPage() {
   const session = await auth();
   if (!session?.user?.id) redirect('/login');
 
-  const projects = await db.project.findMany({
-    where: { userId: session.user.id },
-    orderBy: { updatedAt: 'desc' },
-    include: {
-      crawls: {
-        orderBy: { createdAt: 'desc' },
-        take: 1,
-        select: {
-          id: true,
-          status: true,
-          pagesAnalyzed: true,
-          completedAt: true,
-          healthScore: true,
+  let projects: any[] = [];
+  try {
+    projects = await db.project.findMany({
+      where: { userId: session.user.id },
+      orderBy: { updatedAt: 'desc' },
+      include: {
+        crawls: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          select: {
+            id: true,
+            status: true,
+            pagesAnalyzed: true,
+            completedAt: true,
+            healthScore: true,
+          },
         },
       },
-    },
-  });
+    });
+  } catch (dbErr) {
+    console.warn('Local db query failed on dashboard:', dbErr);
+  }
+
+  // Fallback to Supabase cloud if no projects found locally
+  if (!projects || projects.length === 0) {
+    try {
+      const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+      if (isSupabaseConfigured()) {
+        const { data: sbProjects } = await supabaseAdmin.client
+          .from('Project')
+          .select('*')
+          .eq('userId', session.user.id)
+          .order('updatedAt', { ascending: false });
+
+        if (sbProjects && sbProjects.length > 0) {
+          projects = sbProjects.map((p) => ({
+            ...p,
+            crawls: [],
+          }));
+        }
+      }
+    } catch (sbErr) {
+      console.warn('Supabase dashboard query notice:', sbErr);
+    }
+  }
 
   return (
     <div className="animate-in">

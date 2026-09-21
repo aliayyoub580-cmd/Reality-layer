@@ -1,8 +1,8 @@
 import { auth } from '@/lib/auth';
-import { db } from '@/lib/db';
 import { redirect, notFound } from 'next/navigation';
 import { DashboardShell } from '@/components/layout/dashboard-shell';
 import { AiAssistantDrawer } from '@/components/twin/ai-assistant-drawer';
+import { findProject } from '@/lib/supabase';
 
 export default async function ProjectLayout({
   children,
@@ -16,13 +16,7 @@ export default async function ProjectLayout({
 
   const { projectId } = await params;
 
-  const project = await db.project.findFirst({
-    where: {
-      id: projectId,
-      userId: session.user.id,
-    },
-    select: { id: true, name: true, domain: true },
-  });
+  const project = await findProject(projectId, session.user.id);
 
   if (!project) notFound();
 

@@ -36,30 +36,52 @@ export async function startCrawl(
   const opts = { ...DEFAULT_CRAWL_OPTIONS, ...options };
 
   // Get project
-  const project = await db.project.findUnique({ where: { id: projectId } });
+  let project: { id: string; url: string; domain: string } | null = null;
+  try {
+    project = await db.project.findUnique({ where: { id: projectId } });
+  } catch {}
+
+  if (!project) {
+    try {
+      const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+      if (isSupabaseConfigured()) {
+        const { data } = await supabaseAdmin.client
+          .from('Project')
+          .select('id, url, domain')
+          .eq('id', projectId)
+          .maybeSingle();
+        if (data) project = data;
+      }
+    } catch {}
+  }
+
   if (!project) throw new Error('Project not found');
 
-  // Create crawl record
-  const crawl = await db.crawl.create({
-    data: {
-      projectId,
-      status: 'CRAWLING',
-      startedAt: new Date(),
-    },
-  });
+  const crawlId = `crawl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-  // Update project status
-  await db.project.update({
-    where: { id: projectId },
-    data: { status: 'CRAWLING' },
-  });
+  // Create crawl record in local DB if writable
+  try {
+    await db.crawl.create({
+      data: {
+        id: crawlId,
+        projectId,
+        status: 'CRAWLING',
+        startedAt: new Date(),
+      },
+    });
+
+    await db.project.update({
+      where: { id: projectId },
+      data: { status: 'CRAWLING' },
+    });
+  } catch {}
 
   // Sync to Supabase
   try {
     const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
     if (isSupabaseConfigured()) {
       await supabaseAdmin.client.from('Crawl').upsert({
-        id: crawl.id,
+        id: crawlId,
         projectId,
         status: 'CRAWLING',
         startedAt: new Date().toISOString(),
@@ -73,21 +95,23 @@ export async function startCrawl(
   }
 
   // Run crawl in background (non-blocking)
-  executeCrawl(project.url, project.domain, projectId, crawl.id, opts).catch(
+  executeCrawl(project.url, project.domain, projectId, crawlId, opts).catch(
     async (error) => {
       console.error('Crawl failed:', error);
-      await db.crawl.update({
-        where: { id: crawl.id },
-        data: {
-          status: 'FAILED',
-          errorMessage: error.message || 'Unknown error',
-          completedAt: new Date(),
-        },
-      });
-      await db.project.update({
-        where: { id: projectId },
-        data: { status: 'FAILED' },
-      });
+      try {
+        await db.crawl.update({
+          where: { id: crawlId },
+          data: {
+            status: 'FAILED',
+            errorMessage: error.message || 'Unknown error',
+            completedAt: new Date(),
+          },
+        });
+        await db.project.update({
+          where: { id: projectId },
+          data: { status: 'FAILED' },
+        });
+      } catch {}
 
       // Sync failure to Supabase
       try {
@@ -97,7 +121,7 @@ export async function startCrawl(
             status: 'FAILED',
             errorMessage: error.message || 'Unknown error',
             completedAt: new Date().toISOString(),
-          }).eq('id', crawl.id);
+          }).eq('id', crawlId);
           await supabaseAdmin.client.from('Project').update({
             status: 'FAILED',
           }).eq('id', projectId);
@@ -108,7 +132,7 @@ export async function startCrawl(
     }
   );
 
-  return crawl.id;
+  return crawlId;
 }
 
 /**

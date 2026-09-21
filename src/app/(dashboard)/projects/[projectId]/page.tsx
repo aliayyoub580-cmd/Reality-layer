@@ -29,20 +29,13 @@ export default async function ProjectOverviewPage({
 
   const { projectId } = await params;
 
-  const project = await db.project.findFirst({
-    where: { id: projectId, userId: session.user.id },
-    include: {
-      crawls: {
-        orderBy: { createdAt: 'desc' },
-        take: 5,
-      },
-      _count: { select: { pages: true, links: true, issues: true } },
-    },
-  });
+  const { findProjectWithDetails } = await import('@/lib/supabase');
+  const details = await findProjectWithDetails(projectId, session.user.id);
 
-  if (!project) notFound();
+  if (!details) notFound();
 
-  const lastCrawl = project.crawls[0];
+  const { project, crawls, counts } = details;
+  const lastCrawl = crawls[0];
   const healthScore = lastCrawl?.healthScore ?? project.healthScore;
 
   // Determine if crawl was a limited partial sample
@@ -51,57 +44,78 @@ export default async function ProjectOverviewPage({
       (lastCrawl.pagesDiscovered > lastCrawl.pagesAnalyzed ||
         lastCrawl.errorMessage?.includes('Limited crawl'))
   );
-  const pagesAnalyzed = lastCrawl?.pagesAnalyzed ?? project._count.pages;
+  const pagesAnalyzed = lastCrawl?.pagesAnalyzed ?? counts.pages;
 
   // Get issue counts by severity
-  const issueCounts = lastCrawl
-    ? await db.issue.groupBy({
-        by: ['severity'],
-        where: { projectId, crawlId: lastCrawl.id },
-        _count: true,
-      })
-    : [];
+  let issueCounts: any[] = [];
+  let distinctIssueTypes: any[] = [];
+  let unlinkedPagesCount = 0;
+  let brokenLinkCount = 0;
+
+  if (lastCrawl) {
+    try {
+      [issueCounts, distinctIssueTypes, unlinkedPagesCount, brokenLinkCount] = await Promise.all([
+        db.issue.groupBy({
+          by: ['severity'],
+          where: { projectId, crawlId: lastCrawl.id },
+          _count: true,
+        }),
+        db.issue.groupBy({
+          by: ['type'],
+          where: { projectId, crawlId: lastCrawl.id },
+        }),
+        db.page.count({
+          where: {
+            projectId,
+            crawlId: lastCrawl.id,
+            inboundLinks: { none: {} },
+            path: { not: '/' },
+            statusCode: 200,
+            isIndexable: true,
+          },
+        }),
+        db.link.count({
+          where: {
+            projectId,
+            crawlId: lastCrawl.id,
+            isInternal: true,
+            statusCode: { in: [404, 410, 500, 502, 503] },
+          },
+        }),
+      ]);
+    } catch {
+      // Fallback for Supabase cloud
+      try {
+        const { supabaseAdmin } = await import('@/lib/supabase');
+        const { data: issues } = await supabaseAdmin.client
+          .from('Issue')
+          .select('severity, type')
+          .eq('projectId', projectId)
+          .eq('crawlId', lastCrawl.id);
+
+        if (issues) {
+          const sevMap: Record<string, number> = {};
+          const typeSet = new Set<string>();
+          issues.forEach((i: any) => {
+            sevMap[i.severity] = (sevMap[i.severity] || 0) + 1;
+            if (i.type) typeSet.add(i.type);
+          });
+          issueCounts = Object.entries(sevMap).map(([severity, count]) => ({
+            severity,
+            _count: count,
+          }));
+          distinctIssueTypes = Array.from(typeSet).map((type) => ({ type }));
+        }
+      } catch {}
+    }
+  }
 
   const criticalCount = issueCounts.find((i) => i.severity === 'CRITICAL')?._count ?? 0;
   const warningCount = issueCounts.find((i) => i.severity === 'WARNING')?._count ?? 0;
   const infoCount = issueCounts.find((i) => i.severity === 'INFO')?._count ?? 0;
 
-  // Get distinct issue types count
-  const distinctIssueTypes = lastCrawl
-    ? await db.issue.groupBy({
-        by: ['type'],
-        where: { projectId, crawlId: lastCrawl.id },
-      })
-    : [];
-
-  // Unlinked pages calculation (zero inbound links, indexable, status 200, non-root)
-  const unlinkedPagesCount = lastCrawl
-    ? await db.page.count({
-        where: {
-          projectId,
-          crawlId: lastCrawl.id,
-          inboundLinks: { none: {} },
-          path: { not: '/' },
-          statusCode: 200,
-          isIndexable: true,
-        },
-      })
-    : 0;
-
   // In a limited partial crawl, unlinked pages are potential/unknown, NOT confirmed orphans
   const confirmedOrphanCount = isLimited ? 0 : unlinkedPagesCount;
-
-  // Broken link count (confirmed HTTP errors)
-  const brokenLinkCount = lastCrawl
-    ? await db.link.count({
-        where: {
-          projectId,
-          crawlId: lastCrawl.id,
-          isInternal: true,
-          statusCode: { in: [404, 410, 500, 502, 503] },
-        },
-      })
-    : 0;
 
   const stats = [
     {
@@ -255,11 +269,11 @@ export default async function ProjectOverviewPage({
       )}
 
       {/* Crawl history */}
-      {project.crawls.length > 0 && (
+      {crawls.length > 0 && (
         <div>
           <h2 className="mb-4 text-sm font-semibold text-neutral-700">Recent Crawls</h2>
           <div className="card divide-y divide-neutral-100">
-            {project.crawls.map((crawl) => (
+            {crawls.map((crawl: any) => (
               <div key={crawl.id} className="flex items-center justify-between px-5 py-3">
                 <div className="flex items-center gap-3">
                   <div className={`h-2 w-2 rounded-full ${

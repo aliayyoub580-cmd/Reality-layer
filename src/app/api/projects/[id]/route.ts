@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { db } from '@/lib/db';
 import { updateProjectSchema } from '@/lib/validations';
+import { findProject, findProjectWithDetails } from '@/lib/supabase';
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -17,44 +18,22 @@ export async function GET(request: Request, { params }: RouteParams) {
 
     const { id } = await params;
 
-    const project = await db.project.findFirst({
-      where: {
-        id,
-        userId: session.user.id,
-      },
-      include: {
-        crawls: {
-          orderBy: { createdAt: 'desc' },
-          take: 5,
-          select: {
-            id: true,
-            status: true,
-            pagesDiscovered: true,
-            pagesAnalyzed: true,
-            healthScore: true,
-            startedAt: true,
-            completedAt: true,
-            createdAt: true,
-          },
-        },
-        _count: {
-          select: {
-            pages: true,
-            links: true,
-            issues: true,
-          },
-        },
-      },
-    });
+    const details = await findProjectWithDetails(id, session.user.id);
 
-    if (!project) {
+    if (!details) {
       return NextResponse.json(
         { error: 'Project not found' },
         { status: 404 }
       );
     }
 
-    return NextResponse.json({ success: true, data: project });
+    const data = {
+      ...details.project,
+      crawls: details.crawls,
+      _count: details.counts,
+    };
+
+    return NextResponse.json({ success: true, data });
   } catch (error) {
     console.error('Get project error:', error);
     return NextResponse.json(
@@ -75,10 +54,7 @@ export async function PATCH(request: Request, { params }: RouteParams) {
     const { id } = await params;
 
     // Verify ownership
-    const existing = await db.project.findFirst({
-      where: { id, userId: session.user.id },
-    });
-
+    const existing = await findProject(id, session.user.id);
     if (!existing) {
       return NextResponse.json(
         { error: 'Project not found' },
@@ -96,12 +72,39 @@ export async function PATCH(request: Request, { params }: RouteParams) {
       );
     }
 
-    const project = await db.project.update({
-      where: { id },
-      data: validated.data,
-    });
+    let updatedProject: any = { ...existing, ...validated.data };
 
-    return NextResponse.json({ success: true, data: project });
+    // Update in Supabase
+    try {
+      const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+      if (isSupabaseConfigured()) {
+        const { data: sbUpdated } = await supabaseAdmin.client
+          .from('Project')
+          .update({
+            ...validated.data,
+            updatedAt: new Date().toISOString(),
+          })
+          .eq('id', id)
+          .select()
+          .single();
+
+        if (sbUpdated) {
+          updatedProject = sbUpdated;
+        }
+      }
+    } catch (sbErr) {
+      console.warn('Supabase patch notice:', sbErr);
+    }
+
+    // Try local mirror non-blocking
+    try {
+      await db.project.update({
+        where: { id },
+        data: validated.data,
+      });
+    } catch {}
+
+    return NextResponse.json({ success: true, data: updatedProject });
   } catch (error) {
     console.error('Update project error:', error);
     return NextResponse.json(
@@ -122,10 +125,7 @@ export async function DELETE(request: Request, { params }: RouteParams) {
     const { id } = await params;
 
     // Verify ownership
-    const existing = await db.project.findFirst({
-      where: { id, userId: session.user.id },
-    });
-
+    const existing = await findProject(id, session.user.id);
     if (!existing) {
       return NextResponse.json(
         { error: 'Project not found' },
@@ -133,16 +133,27 @@ export async function DELETE(request: Request, { params }: RouteParams) {
       );
     }
 
-    await db.project.delete({ where: { id } });
+    // Delete from Supabase
+    try {
+      const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+      if (isSupabaseConfigured()) {
+        await supabaseAdmin.client.from('Project').delete().eq('id', id);
+      }
+    } catch (sbErr) {
+      console.warn('Supabase delete notice:', sbErr);
+    }
 
-    // Audit log
-    await db.auditLog.create({
-      data: {
-        userId: session.user.id,
-        action: 'PROJECT_DELETED',
-        details: JSON.stringify({ name: existing.name, domain: existing.domain }),
-      },
-    });
+    // Try local DB non-blocking
+    try {
+      await db.project.delete({ where: { id } });
+      await db.auditLog.create({
+        data: {
+          userId: session.user.id,
+          action: 'PROJECT_DELETED',
+          details: JSON.stringify({ name: existing.name, domain: existing.domain }),
+        },
+      });
+    } catch {}
 
     return NextResponse.json({ success: true, message: 'Project deleted' });
   } catch (error) {

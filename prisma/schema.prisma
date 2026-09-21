@@ -1,0 +1,320 @@
+// RealityLayer Database Schema
+// PostgreSQL in production, SQLite for local development
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Auth Models ────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  password      String?
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts  Account[]
+  sessions  Session[]
+  projects  Project[]
+  auditLogs AuditLog[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─── Project Models ─────────────────────────────────────────
+
+model Project {
+  id         String        @id @default(cuid())
+  userId     String
+  name       String
+  domain     String
+  url        String
+  crawlLimit Int           @default(100)
+  status     String        @default("IDLE") // IDLE, CRAWLING, COMPLETED, FAILED
+  healthScore Float?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  crawls     Crawl[]
+  pages      Page[]
+  links      Link[]
+  issues     Issue[]
+  shareLinks ShareLink[]
+  auditLogs  AuditLog[]
+
+  @@unique([userId, domain])
+  @@index([userId])
+}
+
+// ─── Crawl Models ───────────────────────────────────────────
+
+model Crawl {
+  id              String    @id @default(cuid())
+  projectId       String
+  status          String    @default("QUEUED") // QUEUED, CRAWLING, ANALYZING, COMPLETED, FAILED, CANCELLED
+  pagesDiscovered Int       @default(0)
+  pagesAnalyzed   Int       @default(0)
+  totalPages      Int       @default(0)
+  healthScore     Float?
+  errorMessage    String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+
+  project   Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  pages     Page[]
+  links     Link[]
+  issues    Issue[]
+  changes   CrawlChange[] @relation("CurrentCrawl")
+  prevChanges CrawlChange[] @relation("PreviousCrawl")
+
+  @@index([projectId])
+  @@index([projectId, createdAt])
+}
+
+// ─── Page Models ────────────────────────────────────────────
+
+model Page {
+  id          String  @id @default(cuid())
+  projectId   String
+  crawlId     String
+  url         String
+  path        String
+  title       String?
+  statusCode  Int?
+  contentType String?
+  responseSize Int?
+  loadTime    Int?    // milliseconds
+  healthScore Float?
+  depth       Int?
+
+  // SEO
+  titleLength     Int?
+  metaDescription String?
+  metaDescLength  Int?
+  canonical       String?
+  robotsMeta      String?
+  h1              String?
+  h2Count         Int?    @default(0)
+  ogTitle         String?
+  ogDescription   String?
+  ogImage         String?
+  twitterTitle    String?
+  twitterDescription String?
+  structuredData  String? // JSON string
+  isIndexable     Boolean @default(true)
+
+  // Content
+  wordCount   Int?    @default(0)
+  headings    String? // JSON string of heading hierarchy
+  imageCount  Int?    @default(0)
+  linkCount   Int?    @default(0)
+
+  // Technical
+  isHttps     Boolean @default(false)
+  hasViewport Boolean @default(false)
+  language    String?
+  redirectUrl String?
+  redirectChain String? // JSON string
+
+  // Accessibility
+  imagesWithoutAlt Int? @default(0)
+  missingFormLabels Int? @default(0)
+  headingHierarchyValid Boolean @default(true)
+
+  createdAt DateTime @default(now())
+
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  crawl       Crawl    @relation(fields: [crawlId], references: [id], onDelete: Cascade)
+  outboundLinks Link[] @relation("SourcePage")
+  inboundLinks  Link[] @relation("TargetPage")
+  issues      Issue[]
+
+  @@unique([projectId, crawlId, url])
+  @@index([projectId])
+  @@index([crawlId])
+  @@index([projectId, url])
+}
+
+// ─── Link Models ────────────────────────────────────────────
+
+model Link {
+  id           String  @id @default(cuid())
+  projectId    String
+  crawlId      String
+  sourcePageId String?
+  targetPageId String?
+  sourceUrl    String
+  targetUrl    String
+  anchorText   String?
+  isInternal   Boolean @default(true)
+  isFollowed   Boolean @default(true)
+  statusCode   Int?
+  createdAt    DateTime @default(now())
+
+  project    Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  crawl      Crawl   @relation(fields: [crawlId], references: [id], onDelete: Cascade)
+  sourcePage Page?   @relation("SourcePage", fields: [sourcePageId], references: [id], onDelete: SetNull)
+  targetPage Page?   @relation("TargetPage", fields: [targetPageId], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+  @@index([crawlId])
+  @@index([sourcePageId])
+  @@index([targetPageId])
+  @@index([sourceUrl])
+  @@index([targetUrl])
+}
+
+// ─── Issue Models ───────────────────────────────────────────
+
+model Issue {
+  id            String  @id @default(cuid())
+  projectId     String
+  crawlId       String
+  pageId        String?
+  type          String  // BROKEN_LINK, MISSING_TITLE, MISSING_META_DESC, etc.
+  severity      String  // CRITICAL, WARNING, INFO
+  title         String
+  description   String
+  evidence      String? // JSON string
+  recommendation String?
+  impact        String? // HIGH, MEDIUM, LOW
+  affectedPages Int     @default(1)
+  createdAt     DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  crawl   Crawl   @relation(fields: [crawlId], references: [id], onDelete: Cascade)
+  page    Page?   @relation(fields: [pageId], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+  @@index([crawlId])
+  @@index([pageId])
+  @@index([severity])
+  @@index([type])
+}
+
+// ─── Change Detection ───────────────────────────────────────
+
+model CrawlChange {
+  id              String  @id @default(cuid())
+  projectId       String
+  crawlId         String  // current crawl
+  previousCrawlId String  // previous crawl
+  changeType      String  // ADDED, REMOVED, MODIFIED
+  entityType      String  // PAGE, LINK, METADATA, STATUS
+  entityUrl       String?
+  field           String? // which field changed
+  oldValue        String?
+  newValue        String?
+  description     String
+  createdAt       DateTime @default(now())
+
+  currentCrawl  Crawl @relation("CurrentCrawl", fields: [crawlId], references: [id], onDelete: Cascade)
+  previousCrawl Crawl @relation("PreviousCrawl", fields: [previousCrawlId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([crawlId])
+}
+
+// ─── Sharing ────────────────────────────────────────────────
+
+model ShareLink {
+  id        String    @id @default(cuid())
+  projectId String
+  token     String    @unique
+  isActive  Boolean   @default(true)
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([token])
+}
+
+// ─── Audit Log ──────────────────────────────────────────────
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  projectId String?
+  action    String   // PROJECT_CREATED, CRAWL_STARTED, etc.
+  details   String?  // JSON string
+  createdAt DateTime @default(now())
+
+  user    User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([projectId])
+  @@index([action])
+}
+
+// ─── News Articles (006_news) ───────────────────────────────
+
+model News {
+  id          String    @id @default(uuid())
+  externalId  String    @unique @map("external_id")
+  title       String
+  summary     String?
+  imageUrl    String?   @map("image_url")
+  articleUrl  String    @map("article_url")
+  newsSite    String?   @map("news_site")
+  publishedAt DateTime? @map("published_at")
+  fetchedAt   DateTime  @default(now()) @map("fetched_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@index([publishedAt])
+  @@index([newsSite])
+  @@index([fetchedAt])
+  @@map("news")
+}
+

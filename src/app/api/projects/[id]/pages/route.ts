@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
-import { db } from '@/lib/db';
+import { findProject, getLatestCrawl, findPagesForCrawl } from '@/lib/supabase';
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -19,65 +19,35 @@ export async function GET(request: Request, { params }: RouteParams) {
     const page = parseInt(url.searchParams.get('page') || '1');
     const pageSize = parseInt(url.searchParams.get('pageSize') || '20');
     const sort = url.searchParams.get('sort') || 'path';
-    const order = url.searchParams.get('order') || 'asc';
+    const order = (url.searchParams.get('order') || 'asc') as 'asc' | 'desc';
     const search = url.searchParams.get('search') || '';
 
     // Verify ownership
-    const project = await db.project.findFirst({
-      where: { id, userId: session.user.id },
-      select: { id: true },
-    });
+    const project = await findProject(id, session.user.id);
     if (!project) {
       return NextResponse.json({ error: 'Project not found' }, { status: 404 });
     }
 
     // Get latest crawl
-    const crawl = await db.crawl.findFirst({
-      where: { projectId: id, status: 'COMPLETED' },
-      orderBy: { createdAt: 'desc' },
-    });
+    const crawl = await getLatestCrawl(id, 'COMPLETED');
     if (!crawl) {
-      return NextResponse.json({ success: true, data: { items: [], total: 0, page: 1, pageSize, totalPages: 0 } });
+      return NextResponse.json({
+        success: true,
+        data: { items: [], total: 0, page: 1, pageSize, totalPages: 0 },
+      });
     }
 
-    const where = {
-      crawlId: crawl.id,
-      ...(search ? {
-        OR: [
-          { url: { contains: search } },
-          { title: { contains: search } },
-          { path: { contains: search } },
-        ],
-      } : {}),
-    };
-
-    const [items, total] = await Promise.all([
-      db.page.findMany({
-        where,
-        orderBy: { [sort]: order },
-        skip: (page - 1) * pageSize,
-        take: pageSize,
-        include: {
-          _count: { select: { issues: true, inboundLinks: true, outboundLinks: true } },
-        },
-      }),
-      db.page.count({ where }),
-    ]);
+    const result = await findPagesForCrawl(crawl.id, {
+      page,
+      pageSize,
+      sort,
+      order,
+      search,
+    });
 
     return NextResponse.json({
       success: true,
-      data: {
-        items: items.map((p) => ({
-          ...p,
-          issueCount: p._count.issues,
-          inboundCount: p._count.inboundLinks,
-          outboundCount: p._count.outboundLinks,
-        })),
-        total,
-        page,
-        pageSize,
-        totalPages: Math.ceil(total / pageSize),
-      },
+      data: result,
     });
   } catch (error) {
     console.error('List pages error:', error);

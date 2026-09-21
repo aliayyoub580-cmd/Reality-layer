@@ -161,6 +161,9 @@ async function discoverSitemapUrls(startUrl: string, domain: string): Promise<st
 /**
  * Execute the crawl process
  */
+/**
+ * Execute the crawl process
+ */
 async function executeCrawl(
   startUrl: string,
   domain: string,
@@ -171,6 +174,8 @@ async function executeCrawl(
   const visited = new Set<string>();
   const queue: string[] = [];
   let pagesAnalyzed = 0;
+  const allCrawledPages: any[] = [];
+  const allCrawlLinks: any[] = [];
 
   // Normalize the start URL with canonical domain
   const normalizedStart = normalizeUrl(startUrl, undefined, domain);
@@ -185,6 +190,26 @@ async function executeCrawl(
       queue.push(sUrl);
     }
   }
+
+  // Helper to sync crawl progress to both DB and Supabase
+  const syncProgress = async (discovered: number, analyzed: number, total: number) => {
+    try {
+      await db.crawl.update({
+        where: { id: crawlId },
+        data: { pagesDiscovered: discovered, pagesAnalyzed: analyzed, totalPages: total },
+      });
+    } catch {}
+
+    try {
+      const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+      if (isSupabaseConfigured()) {
+        await supabaseAdmin.client
+          .from('Crawl')
+          .update({ pagesDiscovered: discovered, pagesAnalyzed: analyzed, totalPages: total })
+          .eq('id', crawlId);
+      }
+    } catch {}
+  };
 
   // Process queue
   while (queue.length > 0 && pagesAnalyzed < options.maxPages) {
@@ -210,10 +235,16 @@ async function executeCrawl(
       toFetch.map((url) => processPage(url, domain, projectId, crawlId))
     );
 
-    // Collect new URLs from results
+    // Collect new URLs, pages, and links from results
     for (const result of results) {
       if (result.status === 'fulfilled' && result.value) {
         pagesAnalyzed++;
+        if (result.value.page) {
+          allCrawledPages.push(result.value.page);
+        }
+        if (result.value.links?.length) {
+          allCrawlLinks.push(...result.value.links);
+        }
 
         // Add discovered internal links to queue
         for (const link of result.value.discoveredUrls) {
@@ -232,14 +263,7 @@ async function executeCrawl(
     }
 
     // Update crawl progress
-    await db.crawl.update({
-      where: { id: crawlId },
-      data: {
-        pagesDiscovered: visited.size + queue.length,
-        pagesAnalyzed,
-        totalPages: visited.size,
-      },
-    });
+    await syncProgress(visited.size + queue.length, pagesAnalyzed, visited.size);
 
     // Rate limiting politeness delay
     if (queue.length > 0) {
@@ -251,19 +275,24 @@ async function executeCrawl(
   const isLimited = queue.length > 0 && pagesAnalyzed >= options.maxPages;
 
   // Move to ANALYZING phase
-  await db.crawl.update({
-    where: { id: crawlId },
-    data: { status: 'ANALYZING' },
-  });
+  try {
+    await db.crawl.update({
+      where: { id: crawlId },
+      data: { status: 'ANALYZING' },
+    });
+  } catch {}
+
+  try {
+    const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+    if (isSupabaseConfigured()) {
+      await supabaseAdmin.client
+        .from('Crawl')
+        .update({ status: 'ANALYZING' })
+        .eq('id', crawlId);
+    }
+  } catch {}
 
   // ─── STEP 1: RESOLVE INTERNAL LINK GRAPH (TARGET PAGE IDs) ───────────────────
-  // CRITICAL FIX: Match Link.targetUrl -> Page.id for all crawled pages
-  const allCrawledPages = await db.page.findMany({
-    where: { crawlId },
-    select: { id: true, url: true, path: true, canonical: true },
-  });
-
-  // Build high-speed URL lookup map
   const urlToPageId = new Map<string, string>();
   for (const p of allCrawledPages) {
     urlToPageId.set(p.url, p.id);
@@ -272,45 +301,34 @@ async function executeCrawl(
     if (p.canonical) urlToPageId.set(p.canonical, p.id);
   }
 
-  // Load all links created during this crawl
-  const crawlLinks = await db.link.findMany({
-    where: { crawlId, isInternal: true },
-    select: { id: true, targetUrl: true, sourcePageId: true },
-  });
-
-  // Batch update targetPageId
-  const linkUpdates: Promise<unknown>[] = [];
   const adjacency = new Map<string, Set<string>>();
 
-  for (const l of crawlLinks) {
-    let targetPageId = urlToPageId.get(l.targetUrl);
-    if (!targetPageId) {
-      const normTarget = normalizeUrl(l.targetUrl, undefined, domain);
-      if (normTarget) targetPageId = urlToPageId.get(normTarget);
-    }
-
-    if (targetPageId) {
-      linkUpdates.push(
-        db.link.update({
-          where: { id: l.id },
-          data: { targetPageId },
-        })
-      );
-
-      if (l.sourcePageId) {
-        if (!adjacency.has(l.sourcePageId)) {
-          adjacency.set(l.sourcePageId, new Set());
-        }
-        adjacency.get(l.sourcePageId)!.add(targetPageId);
+  for (const l of allCrawlLinks) {
+    if (l.isInternal) {
+      let targetPageId = urlToPageId.get(l.targetUrl);
+      if (!targetPageId) {
+        const normTarget = normalizeUrl(l.targetUrl, undefined, domain);
+        if (normTarget) targetPageId = urlToPageId.get(normTarget);
       }
-    }
-  }
 
-  // Execute link target resolution
-  if (linkUpdates.length > 0) {
-    // Process in batches of 50 to prevent connection pool exhaustion
-    for (let i = 0; i < linkUpdates.length; i += 50) {
-      await Promise.all(linkUpdates.slice(i, i + 50));
+      if (targetPageId) {
+        l.targetPageId = targetPageId;
+
+        if (l.sourcePageId) {
+          if (!adjacency.has(l.sourcePageId)) {
+            adjacency.set(l.sourcePageId, new Set());
+          }
+          adjacency.get(l.sourcePageId)!.add(targetPageId);
+        }
+
+        // Try local link update non-blocking
+        try {
+          db.link.update({
+            where: { id: l.id },
+            data: { targetPageId },
+          }).catch(() => {});
+        } catch {}
+      }
     }
   }
 
@@ -341,87 +359,127 @@ async function executeCrawl(
   }
 
   // Update depths on Page records
-  const depthUpdates: Promise<unknown>[] = [];
   for (const p of allCrawledPages) {
-    const depth = calculatedDepths.get(p.id) ?? (p.path === '/' ? 0 : 1);
-    depthUpdates.push(
+    p.depth = calculatedDepths.get(p.id) ?? (p.path === '/' ? 0 : 1);
+    try {
       db.page.update({
         where: { id: p.id },
-        data: { depth },
-      })
-    );
+        data: { depth: p.depth },
+      }).catch(() => {});
+    } catch {}
   }
 
-  if (depthUpdates.length > 0) {
-    for (let i = 0; i < depthUpdates.length; i += 50) {
-      await Promise.all(depthUpdates.slice(i, i + 50));
+  // ─── STEP 3: PREPARE ENRICHED PAGES & DETECT ISSUES ──────────────────────────
+  const inboundMap = new Map<string, { id: string }[]>();
+  const outboundMap = new Map<string, { id: string }[]>();
+
+  for (const l of allCrawlLinks) {
+    if (l.sourcePageId) {
+      if (!outboundMap.has(l.sourcePageId)) outboundMap.set(l.sourcePageId, []);
+      outboundMap.get(l.sourcePageId)!.push({ id: l.id });
+    }
+    if (l.targetPageId) {
+      if (!inboundMap.has(l.targetPageId)) inboundMap.set(l.targetPageId, []);
+      inboundMap.get(l.targetPageId)!.push({ id: l.id });
     }
   }
 
-  // ─── STEP 3: RELOAD ENRICHED PAGES & DETECT ISSUES ───────────────────────────
-  const enrichedPages = await db.page.findMany({
-    where: { crawlId },
-    include: {
-      outboundLinks: true,
-      inboundLinks: true,
-    },
-  });
+  for (const p of allCrawledPages) {
+    p.inboundLinks = inboundMap.get(p.id) || [];
+    p.outboundLinks = outboundMap.get(p.id) || [];
+  }
 
-  for (const page of enrichedPages) {
-    const issues = detectIssues(page, enrichedPages, { isLimited });
+  const allIssues: any[] = [];
+  for (const page of allCrawledPages) {
+    const issues = detectIssues(page, allCrawledPages, { isLimited });
     for (const issue of issues) {
-      await db.issue.create({
-        data: {
-          projectId,
-          crawlId,
-          pageId: page.id,
-          ...issue,
-        },
-      });
+      const issueRecord = {
+        id: `issue_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        projectId,
+        crawlId,
+        pageId: page.id,
+        ...issue,
+      };
+      allIssues.push(issueRecord);
+
+      try {
+        db.issue.create({ data: issueRecord }).catch(() => {});
+      } catch {}
     }
   }
 
   // ─── STEP 4: CALCULATE NORMALIZED HEALTH SCORES ──────────────────────────────
-  const allIssues = await db.issue.findMany({ where: { crawlId } });
-  const overallHealth = calculateHealthScore(enrichedPages, allIssues, { isLimited });
+  const overallHealth = calculateHealthScore(allCrawledPages, allIssues, { isLimited });
 
-  // Update page-level health scores
-  for (const page of enrichedPages) {
+  for (const page of allCrawledPages) {
     const pageIssues = allIssues.filter((i) => i.pageId === page.id);
-    const pageHealth = calculateHealthScore([page], pageIssues, { isLimited });
-    await db.page.update({
-      where: { id: page.id },
-      data: { healthScore: pageHealth },
-    });
+    page.healthScore = calculateHealthScore([page], pageIssues, { isLimited });
+
+    try {
+      db.page.update({
+        where: { id: page.id },
+        data: { healthScore: page.healthScore },
+      }).catch(() => {});
+    } catch {}
   }
 
-  // ─── STEP 5: FINALIZE CRAWL RECORD ───────────────────────────────────────────
+  // ─── STEP 5: SYNC ALL CRAWL ARTIFACTS TO SUPABASE ────────────────────────────
+  try {
+    const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
+    if (isSupabaseConfigured()) {
+      // 1. Batch upsert pages (chunks of 50)
+      for (let i = 0; i < allCrawledPages.length; i += 50) {
+        const chunk = allCrawledPages.slice(i, i + 50).map((p) => {
+          const { inboundLinks, outboundLinks, ...rest } = p;
+          return rest;
+        });
+        await supabaseAdmin.client.from('Page').upsert(chunk);
+      }
+
+      // 2. Batch upsert links (chunks of 100)
+      for (let i = 0; i < allCrawlLinks.length; i += 100) {
+        const chunk = allCrawlLinks.slice(i, i + 100);
+        await supabaseAdmin.client.from('Link').upsert(chunk);
+      }
+
+      // 3. Batch insert issues (chunks of 50)
+      for (let i = 0; i < allIssues.length; i += 50) {
+        const chunk = allIssues.slice(i, i + 50);
+        await supabaseAdmin.client.from('Issue').upsert(chunk);
+      }
+    }
+  } catch (sbErr) {
+    console.warn('Supabase bulk crawl sync notice:', sbErr);
+  }
+
+  // ─── STEP 6: FINALIZE CRAWL RECORD ───────────────────────────────────────────
   const limitNote = isLimited
     ? `Limited crawl: Sampled ${pagesAnalyzed} pages (${queue.length} additional URLs pending)`
     : null;
 
-  await db.crawl.update({
-    where: { id: crawlId },
-    data: {
-      status: 'COMPLETED',
-      healthScore: overallHealth,
-      pagesDiscovered: visited.size + queue.length,
-      pagesAnalyzed,
-      totalPages: visited.size,
-      errorMessage: limitNote,
-      completedAt: new Date(),
-    },
-  });
+  try {
+    await db.crawl.update({
+      where: { id: crawlId },
+      data: {
+        status: 'COMPLETED',
+        healthScore: overallHealth,
+        pagesDiscovered: visited.size + queue.length,
+        pagesAnalyzed,
+        totalPages: visited.size,
+        errorMessage: limitNote,
+        completedAt: new Date(),
+      },
+    });
 
-  await db.project.update({
-    where: { id: projectId },
-    data: {
-      status: 'COMPLETED',
-      healthScore: overallHealth,
-    },
-  });
+    await db.project.update({
+      where: { id: projectId },
+      data: {
+        status: 'COMPLETED',
+        healthScore: overallHealth,
+      },
+    });
+  } catch {}
 
-  // Sync crawl completion to Supabase
   try {
     const { isSupabaseConfigured, supabaseAdmin } = await import('@/lib/supabase');
     if (isSupabaseConfigured()) {
@@ -442,12 +500,14 @@ async function executeCrawl(
       }).eq('id', projectId);
     }
   } catch (sbErr) {
-    console.warn('Supabase crawl completion sync notice:', sbErr);
+    console.warn('Supabase crawl completion notice:', sbErr);
   }
 }
 
 interface ProcessResult {
   discoveredUrls: string[];
+  page?: any;
+  links?: any[];
 }
 
 /**
@@ -460,6 +520,7 @@ async function processPage(
   crawlId: string
 ): Promise<ProcessResult> {
   const discoveredUrls: string[] = [];
+  const pageId = `page_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
   // Fetch the page
   const fetchResult = await fetchPage(url);
@@ -468,25 +529,30 @@ async function processPage(
 
   // If fetch failed or response has no HTML
   if (fetchResult.error || !fetchResult.html) {
-    await db.page.create({
-      data: {
-        projectId,
-        crawlId,
-        url,
-        path,
-        statusCode: fetchResult.statusCode || null,
-        contentType: fetchResult.contentType || null,
-        responseSize: fetchResult.responseSize,
-        loadTime: fetchResult.loadTime,
-        isHttps,
-        redirectUrl: fetchResult.redirectChain[0] || null,
-        redirectChain:
-          fetchResult.redirectChain.length > 0
-            ? JSON.stringify(fetchResult.redirectChain)
-            : null,
-      },
-    });
-    return { discoveredUrls };
+    const errorPageRecord = {
+      id: pageId,
+      projectId,
+      crawlId,
+      url,
+      path,
+      statusCode: fetchResult.statusCode || null,
+      contentType: fetchResult.contentType || null,
+      responseSize: fetchResult.responseSize,
+      loadTime: fetchResult.loadTime,
+      isHttps,
+      redirectUrl: fetchResult.redirectChain[0] || null,
+      redirectChain:
+        fetchResult.redirectChain.length > 0
+          ? JSON.stringify(fetchResult.redirectChain)
+          : null,
+      isIndexable: false,
+    };
+
+    try {
+      await db.page.create({ data: errorPageRecord });
+    } catch {}
+
+    return { discoveredUrls, page: errorPageRecord, links: [] };
   }
 
   // Parse HTML with baseDomain awareness
@@ -496,76 +562,85 @@ async function processPage(
   const finalStoredUrl = normalizeUrl(fetchResult.finalUrl || url, url, domain) || url;
 
   // Create page record
-  const page = await db.page.create({
-    data: {
-      projectId,
-      crawlId,
-      url: finalStoredUrl,
-      path,
-      title: parsed.title,
-      statusCode: fetchResult.statusCode,
-      contentType: fetchResult.contentType,
-      responseSize: fetchResult.responseSize,
-      loadTime: fetchResult.loadTime,
-      isHttps,
-      titleLength: parsed.titleLength,
-      metaDescription: parsed.metaDescription,
-      metaDescLength: parsed.metaDescLength,
-      canonical: parsed.canonical,
-      robotsMeta: parsed.robotsMeta,
-      h1: parsed.h1,
-      h2Count: parsed.h2Count,
-      ogTitle: parsed.ogTitle,
-      ogDescription: parsed.ogDescription,
-      ogImage: parsed.ogImage,
-      twitterTitle: parsed.twitterTitle,
-      twitterDescription: parsed.twitterDescription,
-      structuredData:
-        parsed.structuredData.length > 0
-          ? JSON.stringify(parsed.structuredData)
-          : null,
-      isIndexable: parsed.isIndexable,
-      hasViewport: parsed.hasViewport,
-      language: parsed.language,
-      wordCount: parsed.wordCount,
-      imageCount: parsed.imageCount,
-      imagesWithoutAlt: parsed.imagesWithoutAlt,
-      missingFormLabels: parsed.missingFormLabels,
-      headingHierarchyValid: parsed.headingHierarchyValid,
-      headings: JSON.stringify(parsed.headings),
-      linkCount: parsed.links.length,
-      redirectUrl: fetchResult.redirectChain[0] || null,
-      redirectChain:
-        fetchResult.redirectChain.length > 0
-          ? JSON.stringify(fetchResult.redirectChain)
-          : null,
-    },
-  });
+  const pageRecord = {
+    id: pageId,
+    projectId,
+    crawlId,
+    url: finalStoredUrl,
+    path,
+    title: parsed.title,
+    statusCode: fetchResult.statusCode,
+    contentType: fetchResult.contentType,
+    responseSize: fetchResult.responseSize,
+    loadTime: fetchResult.loadTime,
+    isHttps,
+    titleLength: parsed.titleLength,
+    metaDescription: parsed.metaDescription,
+    metaDescLength: parsed.metaDescLength,
+    canonical: parsed.canonical,
+    robotsMeta: parsed.robotsMeta,
+    h1: parsed.h1,
+    h2Count: parsed.h2Count,
+    ogTitle: parsed.ogTitle,
+    ogDescription: parsed.ogDescription,
+    ogImage: parsed.ogImage,
+    twitterTitle: parsed.twitterTitle,
+    twitterDescription: parsed.twitterDescription,
+    structuredData:
+      parsed.structuredData.length > 0
+        ? JSON.stringify(parsed.structuredData)
+        : null,
+    isIndexable: parsed.isIndexable,
+    hasViewport: parsed.hasViewport,
+    language: parsed.language,
+    wordCount: parsed.wordCount,
+    imageCount: parsed.imageCount,
+    imagesWithoutAlt: parsed.imagesWithoutAlt,
+    missingFormLabels: parsed.missingFormLabels,
+    headingHierarchyValid: parsed.headingHierarchyValid,
+    headings: JSON.stringify(parsed.headings),
+    linkCount: parsed.links.length,
+    redirectUrl: fetchResult.redirectChain[0] || null,
+    redirectChain:
+      fetchResult.redirectChain.length > 0
+        ? JSON.stringify(fetchResult.redirectChain)
+        : null,
+  };
+
+  try {
+    await db.page.create({ data: pageRecord });
+  } catch {}
 
   // Process links extracted from page
+  const pageLinks: any[] = [];
   for (const link of parsed.links) {
     const resolvedUrl = normalizeUrl(link.href, url, domain);
     if (!resolvedUrl) continue;
 
     const isInternal = isInternalUrl(resolvedUrl, domain);
+    const linkRecord = {
+      id: `link_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      projectId,
+      crawlId,
+      sourcePageId: pageId,
+      sourceUrl: finalStoredUrl,
+      targetUrl: resolvedUrl,
+      anchorText: link.anchorText || null,
+      isInternal,
+      isFollowed: link.isFollowed,
+      targetPageId: null,
+    };
 
-    await db.link.create({
-      data: {
-        projectId,
-        crawlId,
-        sourcePageId: page.id,
-        sourceUrl: finalStoredUrl,
-        targetUrl: resolvedUrl,
-        anchorText: link.anchorText || null,
-        isInternal,
-        isFollowed: link.isFollowed,
-      },
-    });
+    pageLinks.push(linkRecord);
+
+    try {
+      db.link.create({ data: linkRecord }).catch(() => {});
+    } catch {}
 
     if (isInternal && isCrawlableUrl(resolvedUrl)) {
       discoveredUrls.push(resolvedUrl);
     }
   }
 
-  return { discoveredUrls };
+  return { discoveredUrls, page: pageRecord, links: pageLinks };
 }
